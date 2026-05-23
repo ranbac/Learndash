@@ -1,0 +1,249 @@
+/**
+ * Plugin Name: LD Bulk Question Category
+ * Description: Thêm action "Gán Category" vào Hành động hàng loạt trong trang danh sách câu hỏi LearnDash.
+ * Version:     2.0.0
+ * Author:      Custom
+ * License:     GPL-2.0+
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+    exit;
+}
+
+// ────────────────────────────────────────────────────────
+// 1. Thêm option vào dropdown "Hành động hàng loạt"
+// ────────────────────────────────────────────────────────
+add_filter( 'bulk_actions-edit-sfwd-question', 'ldbqc_register_bulk_action' );
+function ldbqc_register_bulk_action( $actions ) {
+    $actions['assign_question_category'] = '🏷️ Gán Question Category';
+    return $actions;
+}
+
+// ────────────────────────────────────────────────────────
+// 2. Xử lý khi user nhấn "Áp dụng"
+// ────────────────────────────────────────────────────────
+add_filter( 'handle_bulk_actions-edit-sfwd-question', 'ldbqc_handle_bulk_action', 10, 3 );
+function ldbqc_handle_bulk_action( $redirect_url, $action, $post_ids ) {
+    if ( 'assign_question_category' !== $action ) {
+        return $redirect_url;
+    }
+
+    $category_id = isset( $_REQUEST['ldbqc_category_id'] )
+        ? absint( $_REQUEST['ldbqc_category_id'] )
+        : 0;
+
+    // category_id = 0 => xóa category (hợp lệ)
+    // Kiểm tra category tồn tại nếu > 0
+    if ( $category_id > 0 ) {
+        $mapper = new WpProQuiz_Model_CategoryMapper();
+        $cat    = $mapper->fetchById( $category_id );
+        if ( ! $cat || $cat->getCategoryId() === 0 ) {
+            $redirect_url = add_query_arg( 'ldbqc_error', 'invalid_cat', $redirect_url );
+            return $redirect_url;
+        }
+    }
+
+    global $wpdb;
+    $table = LDLMS_DB::get_table_name( 'quiz_question' );
+    $updated = 0;
+
+    foreach ( $post_ids as $post_id ) {
+        $pro_id = (int) get_post_meta( $post_id, 'question_pro_id', true );
+        if ( ! $pro_id ) {
+            continue;
+        }
+
+        $rows = $wpdb->update(
+            $table,
+            array( 'category_id' => $category_id ),
+            array( 'id' => $pro_id ),
+            array( '%d' ),
+            array( '%d' )
+        );
+
+        if ( $rows !== false ) {
+            $updated++;
+        }
+    }
+
+    $redirect_url = add_query_arg(
+        array(
+            'ldbqc_updated'  => $updated,
+            'ldbqc_cat_id'   => $category_id,
+        ),
+        $redirect_url
+    );
+
+    return $redirect_url;
+}
+
+// ────────────────────────────────────────────────────────
+// 3. Hiển thị thông báo sau khi xử lý xong
+// ────────────────────────────────────────────────────────
+add_action( 'admin_notices', 'ldbqc_show_admin_notice' );
+function ldbqc_show_admin_notice() {
+    $screen = get_current_screen();
+    if ( ! $screen || $screen->id !== 'edit-sfwd-question' ) {
+        return;
+    }
+
+    if ( isset( $_GET['ldbqc_error'] ) && $_GET['ldbqc_error'] === 'invalid_cat' ) {
+        echo '<div class="notice notice-error is-dismissible"><p>❌ Category không hợp lệ. Vui lòng chọn lại.</p></div>';
+        return;
+    }
+
+    if ( isset( $_GET['ldbqc_updated'] ) ) {
+        $n      = absint( $_GET['ldbqc_updated'] );
+        $cat_id = absint( $_GET['ldbqc_cat_id'] ?? 0 );
+
+        if ( $cat_id > 0 ) {
+            $mapper   = new WpProQuiz_Model_CategoryMapper();
+            $cat      = $mapper->fetchById( $cat_id );
+            $cat_name = $cat ? esc_html( $cat->getCategoryName() ) : "#$cat_id";
+        } else {
+            $cat_name = '(Không có category)';
+        }
+
+        echo '<div class="notice notice-success is-dismissible">'
+            . '<p>✅ Đã gán <strong>' . $n . '</strong> câu hỏi vào category <strong>' . $cat_name . '</strong>.</p>'
+            . '</div>';
+    }
+}
+
+// ────────────────────────────────────────────────────────
+// 4. Inject HTML: dropdown chọn category + CSS/JS
+//    Hiển thị ngay dưới thanh bulk-action (dùng restrict_manage_posts)
+// ────────────────────────────────────────────────────────
+add_action( 'restrict_manage_posts', 'ldbqc_render_category_picker' );
+function ldbqc_render_category_picker( $post_type ) {
+    if ( $post_type !== 'sfwd-question' ) {
+        return;
+    }
+
+    if ( ! class_exists( 'WpProQuiz_Model_CategoryMapper' ) ) {
+        return;
+    }
+
+    $mapper     = new WpProQuiz_Model_CategoryMapper();
+    $categories = $mapper->fetchAll();
+
+    ?>
+    <div id="ldbqc-picker" style="display:none; align-items:center; gap:8px; margin:8px 0; padding:10px 12px; background:#fff3cd; border:1px solid #ffc107; border-radius:5px;">
+        <span style="font-weight:600; white-space:nowrap;">🏷️ Chọn Category:</span>
+
+        <select id="ldbqc_category_id" name="ldbqc_category_id" style="min-width:220px;">
+            <option value="0">— Không có category (xóa gán) —</option>
+            <?php foreach ( $categories as $cat ) : ?>
+                <option value="<?php echo esc_attr( $cat->getCategoryId() ); ?>">
+                    <?php echo esc_html( $cat->getCategoryName() ); ?>
+                </option>
+            <?php endforeach; ?>
+        </select>
+
+        <?php
+        // Nút tạo category nhanh
+        wp_nonce_field( 'ldbqc_create_nonce', 'ldbqc_create_nonce_field', false );
+        ?>
+        <input type="text" id="ldbqc-new-cat-input" placeholder="Tên category mới…" style="width:180px;" />
+        <button type="button" id="ldbqc-btn-create" class="button">+ Tạo mới</button>
+        <span id="ldbqc-create-msg" style="color:green; font-size:12px;"></span>
+    </div>
+
+    <style>
+    /* Luôn ẩn picker khi không chọn đúng action */
+    #ldbqc-picker { flex-wrap:wrap; }
+    </style>
+
+    <script>
+    (function ($) {
+        // Hiện/ẩn picker khi chọn action
+        function togglePicker() {
+            var show = false;
+            $('select[name="action"], select[name="action2"]').each(function () {
+                if ($(this).val() === 'assign_question_category') { show = true; }
+            });
+            if (show) {
+                $('#ldbqc-picker').css('display', 'flex');
+            } else {
+                $('#ldbqc-picker').hide();
+            }
+        }
+
+        $(document).on('change', 'select[name="action"], select[name="action2"]', togglePicker);
+        togglePicker(); // khởi tạo
+
+        // Chặn submit nếu chưa chọn category khi action = assign
+        $('form#posts-filter').on('submit', function (e) {
+            var isAssign = false;
+            $('select[name="action"], select[name="action2"]').each(function () {
+                if ($(this).val() === 'assign_question_category') { isAssign = true; }
+            });
+            if (!isAssign) return; // action khác → cho submit bình thường
+
+            // Sync giá trị category cho cả 2 select (top & bottom)
+            // Chỉ cần 1 input name=ldbqc_category_id, WordPress lấy từ $_REQUEST
+        });
+
+        // Tạo category mới qua AJAX
+        $('#ldbqc-btn-create').on('click', function () {
+            var name = $('#ldbqc-new-cat-input').val().trim();
+            if (!name) { alert('Vui lòng nhập tên category.'); return; }
+
+            var $btn = $(this).prop('disabled', true).text('Đang tạo…');
+            $.post(ajaxurl, {
+                action:                'ldbqc_create_category',
+                cat_name:              name,
+                _ajax_nonce:           $('#ldbqc_create_nonce_field').val()
+            }, function (res) {
+                $btn.prop('disabled', false).text('+ Tạo mới');
+                if (res.success) {
+                    var opt = $('<option>', { value: res.data.category_id, text: res.data.category_name });
+                    $('#ldbqc_category_id').append(opt).val(res.data.category_id);
+                    $('#ldbqc-new-cat-input').val('');
+                    $('#ldbqc-create-msg').text('✅ Đã tạo: ' + res.data.category_name).fadeIn().delay(3000).fadeOut();
+                } else {
+                    alert('❌ ' + (res.data && res.data.message ? res.data.message : 'Lỗi không xác định.'));
+                }
+            });
+        });
+
+    }(jQuery));
+    </script>
+    <?php
+}
+
+// ────────────────────────────────────────────────────────
+// 5. AJAX tạo category mới
+// ────────────────────────────────────────────────────────
+add_action( 'wp_ajax_ldbqc_create_category', 'ldbqc_ajax_create_category' );
+function ldbqc_ajax_create_category() {
+    check_ajax_referer( 'ldbqc_create_nonce' );
+
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( array( 'message' => 'Không có quyền.' ) );
+    }
+
+    $name = isset( $_POST['cat_name'] ) ? sanitize_text_field( trim( $_POST['cat_name'] ) ) : '';
+    if ( $name === '' ) {
+        wp_send_json_error( array( 'message' => 'Tên category không được để trống.' ) );
+    }
+
+    if ( ! class_exists( 'WpProQuiz_Model_CategoryMapper' ) ) {
+        wp_send_json_error( array( 'message' => 'LearnDash chưa được kích hoạt.' ) );
+    }
+
+    $mapper   = new WpProQuiz_Model_CategoryMapper();
+    $existing = $mapper->fetchByName( $name );
+    if ( $existing->getCategoryId() > 0 ) {
+        wp_send_json_error( array( 'message' => '"' . $name . '" đã tồn tại.' ) );
+    }
+
+    $cat = new WpProQuiz_Model_Category();
+    $cat->setCategoryName( $name );
+    $mapper->save( $cat );
+
+    wp_send_json_success( array(
+        'category_id'   => $cat->getCategoryId(),
+        'category_name' => $cat->getCategoryName(),
+    ) );
+}
